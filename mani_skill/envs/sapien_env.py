@@ -311,11 +311,11 @@ class BaseEnv(gym.Env):
 
         # Use a fixed (main) seed to enhance determinism
         self._main_seed = None
-        self._set_main_rng([2022 + i for i in range(self.num_envs)])
+        self._set_main_rng(2022)
         self._elapsed_steps = (
             torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
         )
-        obs, _ = self.reset(seed=[2022 + i for i in range(self.num_envs)], options=dict(reconfigure=True))
+        obs, _ = self.reset(seed=2022,options=dict(reconfigure=True))
 
         self._init_raw_obs = common.to_cpu_tensor(obs)
         """the raw observation returned by the env.reset (a cpu torch tensor/dict of tensors). Useful for future observation wrappers to use to auto generate observation spaces"""
@@ -799,7 +799,7 @@ class BaseEnv(gym.Env):
         )
         if reconfigure:
             with torch.random.fork_rng():
-                torch.manual_seed(seed=self._episode_seed[0])
+                torch.manual_seed(seed=self._episode_seed)
                 self._reconfigure(options)
                 self._after_reconfigure(options)
 
@@ -829,7 +829,7 @@ class BaseEnv(gym.Env):
         if self.agent is not None:
             self.agent.reset()
         with torch.random.fork_rng():
-            torch.manual_seed(self._episode_seed[0])
+            torch.manual_seed(self._episode_seed)
             self._initialize_episode(env_idx, options)
         # reset the reset mask back to all ones so any internal code in maniskill can continue to manipulate all scenes at once as usual
         self.scene._reset_mask = torch.ones(
@@ -865,27 +865,27 @@ class BaseEnv(gym.Env):
         if seed is None:
             if self._main_seed is not None:
                 return
-            seed = np.random.RandomState().randint(2**31, size=(self.num_envs,))
-        if isinstance(seed, int):
-            seed = [seed]
+            seed = np.random.RandomState().randint(2**31)
+        # if isinstance(seed, int):
+        #     seed = [seed]
         self._main_seed = seed
-        self._main_rng = np.random.RandomState(self._main_seed[0])
-        if len(self._main_seed) == 1 and self.num_envs > 1:
-            self._main_seed = self._main_seed + np.random.RandomState(self._main_seed[0]).randint(2**31, size=(self.num_envs - 1,)).tolist()
-        self._batched_main_rng = BatchedRNG(self._main_seed, backend=self._batched_rng_backend)
+        self._main_rng = np.random.RandomState(self._main_seed)
+        # if len(self._main_seed) == 1 and self.num_envs > 1:
+        #     self._main_seed = self._main_seed + np.random.RandomState(self._main_seed[0]).randint(2**31, size=(self.num_envs - 1,)).tolist()
+        # self._batched_main_rng = BatchedRNG(self._main_seed, backend=self._batched_rng_backend)
     def _set_episode_rng(self, seed: Union[None, list[int]]):
         """Set the random generator for current episode."""
-        if isinstance(seed, int):
-            seed = [seed]
+        # if isinstance(seed, int):
+        #     seed = [seed]
         if seed is None:
-            self._episode_seed = self._batched_main_rng.randint(2**31).tolist()
+            self._episode_seed = self._main_rng.randint(2**31)
         else:
             self._episode_seed = seed
-        if len(self._episode_seed) == 1 and self.num_envs > 1:
-            self._episode_seed = self._episode_seed + np.random.RandomState(self._episode_seed[0]).randint(2**31, size=(self.num_envs - 1,)).tolist()
-        self._episode_rng = np.random.RandomState(self._episode_seed[0])
+        # if len(self._episode_seed) == 1 and self.num_envs > 1:
+        #     self._episode_seed = self._episode_seed + np.random.RandomState(self._episode_seed[0]).randint(2**31, size=(self.num_envs - 1,)).tolist()
+        self._episode_rng = np.random.RandomState(self._episode_seed)
         # we keep _episode_rng for backwards compatibility but recommend using _batched_episode_rng for randomization
-        self._batched_episode_rng = BatchedRNG(self._episode_seed, backend=self._batched_rng_backend)
+        # self._batched_episode_rng = BatchedRNG(self._episode_seed, backend=self._batched_rng_backend)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         """Initialize the episode, e.g., poses of actors and articulations, as well as task relevant data like randomizing

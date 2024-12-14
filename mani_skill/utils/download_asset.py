@@ -5,6 +5,7 @@ import os.path as osp
 import shutil
 import urllib.request
 import zipfile
+import ssl
 from pathlib import Path
 from urllib.error import URLError
 
@@ -112,8 +113,9 @@ def download(
                     pbar.total = size
                 pbar.update(bs)
 
+        ssl._create_default_https_context = ssl._create_unverified_context
         tmp_filename, _ = urllib.request.urlretrieve(
-            data_source.url, reporthook=show_progress
+            data_source.url, reporthook=show_progress,
         )
         if verbose:
             pbar.close()

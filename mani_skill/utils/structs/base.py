@@ -34,7 +34,7 @@ class BaseStruct(Generic[T]):
     def __post_init__(self):
         if not isinstance(self._scene_idxs, torch.Tensor):
             self._scene_idxs = common.to_tensor(self._scene_idxs)
-        self._scene_idxs = self._scene_idxs.to(torch.int).to(self.device)
+        self._scene_idxs = self._scene_idxs.to(torch.long).to(self.device)
 
     def __str__(self):
         return f"<struct of type {self.__class__}; managing {self._num_objs} {self._objs[0].__class__} objects>"
@@ -107,7 +107,7 @@ class PhysxRigidBodyComponentStruct(PhysxRigidBaseComponentStruct[T], Generic[T]
             self._body_data_index_internal = torch.tensor(
                 [body.gpu_pose_index for body in self._bodies], device=self.device
             )
-        return self._body_data_index_internal
+        return self._body_data_index_internal.long()
 
     @property
     def _body_data(self) -> torch.Tensor:

@@ -82,7 +82,7 @@ class BaseController:
             self.joints = get_joints_by_names(self.articulation, joint_names)
             self.active_joint_indices = get_active_joint_indices(
                 self.articulation, joint_names
-            ).to(self.device)
+            ).to(self.device).long()
         except Exception as err:
             print("Encounter error when parsing joint names.")
             active_joint_names = [x.name for x in self.articulation.get_active_joints()]

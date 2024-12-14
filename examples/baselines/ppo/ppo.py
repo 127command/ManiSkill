@@ -466,6 +466,9 @@ if __name__ == "__main__":
             model_path = f"runs/{run_name}/final_ckpt.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
+        print("Close logger")
         logger.close()
+    print("Close env")
     envs.close()
+    print("Close eval env")
     eval_envs.close()

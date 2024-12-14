@@ -16,7 +16,7 @@ from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
 
-@register_env("PullCubeTool-v1", max_episode_steps=100)
+@register_env("PullCubeTool-v1", max_episode_steps=1000)
 class PullCubeToolEnv(BaseEnv):
     """
     **Task Description**
@@ -143,38 +143,39 @@ class PullCubeToolEnv(BaseEnv):
         )
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        with torch.device(self.device):
-            b = len(env_idx)
-            self.scene_builder.initialize(env_idx)
+        # with torch.device(self.device):
+        torch.device(self.device)
+        b = len(env_idx)
+        self.scene_builder.initialize(env_idx)
 
-            tool_xyz = torch.zeros((b, 3), device=self.device)
-            tool_xyz[..., :2] = -torch.rand((b, 2), device=self.device) * 0.2 - 0.1
-            tool_xyz[..., 2] = self.height / 2
-            tool_q = torch.tensor([1, 0, 0, 0], device=self.device).expand(b, 4)
+        tool_xyz = torch.zeros((b, 3), device=self.device)
+        tool_xyz[..., :2] = -torch.rand((b, 2), device=self.device) * 0.2 - 0.1
+        tool_xyz[..., 2] = self.height / 2
+        tool_q = torch.tensor([1, 0, 0, 0], device=self.device).expand(b, 4)
 
-            tool_pose = Pose.create_from_pq(p=tool_xyz, q=tool_q)
-            self.l_shape_tool.set_pose(tool_pose)
+        tool_pose = Pose.create_from_pq(p=tool_xyz, q=tool_q)
+        self.l_shape_tool.set_pose(tool_pose)
 
-            cube_xyz = torch.zeros((b, 3), device=self.device)
-            cube_xyz[..., 0] = (
-                self.arm_reach
-                + torch.rand(b, device=self.device) * (self.handle_length)
-                - 0.3
-            )
-            cube_xyz[..., 1] = torch.rand(b, device=self.device) * 0.3 - 0.25
-            cube_xyz[..., 2] = self.cube_size / 2 + 0.015
+        cube_xyz = torch.zeros((b, 3), device=self.device)
+        cube_xyz[..., 0] = (
+            self.arm_reach
+            + torch.rand(b, device=self.device) * (self.handle_length)
+            - 0.3
+        )
+        cube_xyz[..., 1] = torch.rand(b, device=self.device) * 0.3 - 0.25
+        cube_xyz[..., 2] = self.cube_size / 2 + 0.015
 
-            cube_q = randomization.random_quaternions(
-                b,
-                lock_x=True,
-                lock_y=True,
-                lock_z=False,
-                bounds=(-np.pi / 6, np.pi / 6),
-                device=self.device,
-            )
+        cube_q = randomization.random_quaternions(
+            b,
+            lock_x=True,
+            lock_y=True,
+            lock_z=False,
+            bounds=(-np.pi / 6, np.pi / 6),
+            device=self.device,
+        )
 
-            cube_pose = Pose.create_from_pq(p=cube_xyz, q=cube_q)
-            self.cube.set_pose(cube_pose)
+        cube_pose = Pose.create_from_pq(p=cube_xyz, q=cube_q)
+        self.cube.set_pose(cube_pose)
 
     def _get_obs_extra(self, info: Dict):
         obs = dict(

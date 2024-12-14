@@ -18,7 +18,7 @@ class PDJointPosController(BaseController):
 
     def _get_joint_limits(self):
         qlimits = (
-            self.articulation.get_qlimits()[0, self.active_joint_indices].cpu().numpy()
+            self.articulation.get_qlimits()[0, self.active_joint_indices.long()].cpu().numpy()
         )
         # Override if specified
         if self.config.lower is not None:

@@ -245,7 +245,7 @@ class Articulation(BaseStruct[physx.PhysxArticulation]):
         return torch.tensor(
             [px_articulation.gpu_index for px_articulation in self._objs],
             device=self.device,
-            dtype=torch.int32,
+            dtype=torch.long,
         )
 
     @cached_property

@@ -20,6 +20,14 @@ from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs import Articulation, Link, Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
+def Find_middle_point(mesh: trimesh.Trimesh):
+    # n = np.mean(mesh.vertex_normals, axis=0)
+    # dot_products = np.dot(mesh.vertex_normals, n)
+    # most_aligned_index = np.argmax(dot_products)
+    # return mesh.vertices[most_aligned_index]
+    p = np.mean(mesh.vertices, axis=0)
+    return mesh.vertices[np.argmin(np.linalg.norm(mesh.vertices - p, axis=1))]
+
 CABINET_COLLISION_BIT = 29
 BUCKET_COLLISION_BIT = 28
 
@@ -52,6 +60,7 @@ class FinalEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["fetch"]
     agent: Union[Fetch]
     drawer_handle_types = ["prismatic"]
+    bucket_handle_types = ["revolute_unwrapped"]
     DRAWER_JSON = (
         PACKAGE_ASSET_DIR / "partnet_mobility/meta/info_cabinet_drawer_train.json"
     )
@@ -106,7 +115,7 @@ class FinalEnv(BaseEnv):
 
     @property
     def _default_human_render_camera_configs(self):
-        pose = sapien_utils.look_at(eye=[-1.8, -1.3, 1.8], target=[-0.3, 0.5, 0])
+        pose = sapien_utils.look_at(eye=[-2.2, -1.3, 2], target=[-0, 0.5, 0])
         return CameraConfig(
             "render_camera", pose=pose, width=512, height=512, fov=1, near=0.01, far=100
         )
@@ -146,7 +155,7 @@ class FinalEnv(BaseEnv):
                 self.scene, f"partnet-mobility:{model_id}"
             )
             bucket_builder.set_scene_idxs(scene_idxs=[i])
-            bucket_builder.initial_pose = sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0])
+            bucket_builder.initial_pose = sapien.Pose(p=[0, -1.1, 0.4], q=[1, 0, 0, 0])
             bucket = bucket_builder.build(name=f"{model_id}-{i}")
             self.remove_from_state_dict_registry(bucket)
             for link in bucket.links:
@@ -158,7 +167,7 @@ class FinalEnv(BaseEnv):
             handle_links_meshes.append([])
 
             for link, joint in zip(bucket.links, bucket.joints):
-                if joint.type[0] in self.drawer_handle_types:
+                if joint.type[0] in self.bucket_handle_types:
                     handle_links[-1].append(link)
                     handle_links_meshes[-1].append(
                         link.generate_mesh(
@@ -172,12 +181,12 @@ class FinalEnv(BaseEnv):
         self.add_to_state_dict_registry(self.bucket)
         self.bucket_handle_link = Link.merge(
             [links[link_ids[i] % len(links)] for i, links in enumerate(handle_links)],
-            name="handle_link",
+            name="bucket_handle_link",
         )
         self.bucket_handle_link_pos = common.to_tensor(
             np.array(
                 [
-                    meshes[link_ids[i] % len(meshes)].bounding_box.center_mass
+                    Find_middle_point(meshes[link_ids[i] % len(meshes)])
                     for i, meshes in enumerate(handle_links_meshes)
                 ]
             ),
@@ -187,7 +196,7 @@ class FinalEnv(BaseEnv):
             self.scene,
             radius=0.02,
             color=[0, 0, 1, 1],
-            name="handle_link_goal",
+            name="bucket_handle_link_goal",
             body_type="kinematic",
             add_collision=False,
             initial_pose=sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]),
@@ -196,6 +205,16 @@ class FinalEnv(BaseEnv):
     def _load_cabinets(self, joint_types: List[str]):
         # we sample random cabinet model_ids with numpy as numpy is always deterministic based on seed, regardless of
         # GPU/CPU simulation backends. This is useful for replaying demonstrations.
+        # model_ids = self._batched_episode_rng.choice(self.all_cabinet_model_ids)
+
+        self.cube = actors.build_cube(
+            self.scene,
+            half_size=0.01,
+            color=[1, 0, 0, 1],
+            name="cube",
+            initial_pose=sapien.Pose(p=[-0.5, 0, 0.015]),
+        )
+
         model_ids = self._batched_episode_rng.choice(self.all_cabinet_model_ids)
         link_ids = self._batched_episode_rng.randint(0, 2**31)
 
@@ -245,7 +264,7 @@ class FinalEnv(BaseEnv):
         self.add_to_state_dict_registry(self.cabinet)
         self.drawer_handle_link = Link.merge(
             [links[link_ids[i] % len(links)] for i, links in enumerate(handle_links)],
-            name="handle_link",
+            name="drawer_handle_link",
         )
         # store the position of the handle mesh itself relative to the link it is apart of
         self.drawer_handle_link_pos = common.to_tensor(
@@ -262,7 +281,7 @@ class FinalEnv(BaseEnv):
             self.scene,
             radius=0.02,
             color=[0, 1, 0, 1],
-            name="handle_link_goal",
+            name="drawer_handle_link_goal",
             body_type="kinematic",
             add_collision=False,
             initial_pose=sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]),
@@ -286,24 +305,25 @@ class FinalEnv(BaseEnv):
         qmin, qmax = target_qlimits[..., 0], target_qlimits[..., 1]
         self.target_qpos = qmin + (qmax - qmin) * self.min_open_frac
 
-    def handle_link_positions(self, env_idx: Optional[torch.Tensor] = None):
+    def handle_link_positions(self, lk, lkpos, env_idx: Optional[torch.Tensor] = None):
         if env_idx is None:
             return transform_points(
-                self.drawer_handle_link.pose.to_transformation_matrix().clone(),
-                common.to_tensor(self.drawer_handle_link_pos, device=self.device),
+                lk.pose.to_transformation_matrix().clone(),
+                common.to_tensor(lkpos, device=self.device),
             )
         return transform_points(
-            self.drawer_handle_link.pose[env_idx].to_transformation_matrix().clone(),
-            common.to_tensor(self.drawer_handle_link_pos[env_idx], device=self.device),
+            lk.pose[env_idx].to_transformation_matrix().clone(),
+            common.to_tensor(lkpos[env_idx], device=self.device),
         )
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-
         with torch.device(self.device):
             b = len(env_idx)
             xy = torch.zeros((b, 3))
             xy[:, 2] = self.cabinet_zs[env_idx]
             self.cabinet.set_pose(Pose.create_from_pq(p=xy))
+            xy[:,:3] = torch.tensor([0, -1.1, 0.4])
+            self.bucket.set_pose(Pose.create_from_pq(p=xy))
 
             # initialize robot
             if self.robot_uids == "fetch":
@@ -344,6 +364,9 @@ class FinalEnv(BaseEnv):
             qlimits = self.cabinet.get_qlimits()  # [b, self.cabinet.max_dof, 2])
             self.cabinet.set_qpos(qlimits[env_idx, :, 0])
             self.cabinet.set_qvel(self.cabinet.qpos[env_idx] * 0)
+            qlimits = self.bucket.get_qlimits()  # [b, self.cabinet.max_dof, 2])
+            self.bucket.set_qpos(qlimits[env_idx, :, 0])
+            self.bucket.set_qvel(self.bucket.qpos[env_idx] * 0)
 
             # NOTE (stao): This is a temporary work around for the issue where the cabinet drawers/doors might open
             # themselves on the first step. It's unclear why this happens on GPU sim only atm.
@@ -356,7 +379,10 @@ class FinalEnv(BaseEnv):
                 self.scene._gpu_fetch_all()
 
             self.drawer_handle_link_goal.set_pose(
-                Pose.create_from_pq(p=self.handle_link_positions(env_idx))
+                Pose.create_from_pq(p=self.handle_link_positions(self.drawer_handle_link, self.drawer_handle_link_pos, env_idx))
+            )
+            self.bucket_handle_link_goal.set_pose(
+                Pose.create_from_pq(p=self.handle_link_positions(self.bucket_handle_link, self.bucket_handle_link_pos, env_idx))
             )
 
     def _after_control_step(self):
@@ -367,7 +393,10 @@ class FinalEnv(BaseEnv):
             self.scene.px.gpu_update_articulation_kinematics()
             self.scene._gpu_fetch_all()
         self.drawer_handle_link_goal.set_pose(
-            Pose.create_from_pq(p=self.handle_link_positions())
+            Pose.create_from_pq(p=self.handle_link_positions(self.drawer_handle_link, self.drawer_handle_link_pos))
+        )
+        self.bucket_handle_link_goal.set_pose(
+            Pose.create_from_pq(p=self.handle_link_positions(self.bucket_handle_link, self.bucket_handle_link_pos))
         )
         if self.gpu_sim_enabled:
             self.scene._gpu_apply_all()
@@ -377,14 +406,14 @@ class FinalEnv(BaseEnv):
         # we can still fetch a joint that represents the parent joint of all those links
         # and easily get the qpos value.
         open_enough = self.drawer_handle_link.joint.qpos >= self.target_qpos
-        handle_link_pos = self.handle_link_positions()
+        drawer_handle_link_pos = self.handle_link_positions(self.drawer_handle_link, self.drawer_handle_link_pos)
 
         link_is_static = (
             torch.linalg.norm(self.drawer_handle_link.angular_velocity, axis=1) <= 1
         ) & (torch.linalg.norm(self.drawer_handle_link.linear_velocity, axis=1) <= 0.1)
         return {
             "success": open_enough & link_is_static,
-            "handle_link_pos": handle_link_pos,
+            "drawer_handle_link_pos": drawer_handle_link_pos,
             "open_enough": open_enough,
         }
 
@@ -395,15 +424,15 @@ class FinalEnv(BaseEnv):
 
         if "state" in self.obs_mode:
             obs.update(
-                tcp_to_handle_pos=info["handle_link_pos"] - self.agent.tcp.pose.p,
-                target_link_qpos=self.drawer_handle_link.joint.qpos,
-                target_handle_pos=info["handle_link_pos"],
+                tcp_to_drawer_handle_pos=info["drawer_handle_link_pos"] - self.agent.tcp.pose.p,
+                target_drawer_link_qpos=self.drawer_handle_link.joint.qpos,
+                target_drawer_handle_pos=info["drawer_handle_link_pos"],
             )
         return obs
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         tcp_to_handle_dist = torch.linalg.norm(
-            self.agent.tcp.pose.p - info["handle_link_pos"], axis=1
+            self.agent.tcp.pose.p - info["drawer_handle_link_pos"], axis=1
         )
         reaching_reward = 1 - torch.tanh(5 * tcp_to_handle_dist)
         amount_to_open_left = torch.div(

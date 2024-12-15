@@ -46,6 +46,10 @@ def _load_partnet_mobility_dataset():
         raise RuntimeError(
             "Partnet Mobility dataset not found. Download it by running python -m mani_skill.utils.download_asset partnet_mobility_cabinet"
         )
+    
+        raise RuntimeError(
+            "Partnet Mobility dataset not found. Download it by running python -m mani_skill.utils.download_asset partnet_mobility_bucket"
+        )
 
 
 def get_partnet_mobility_builder(

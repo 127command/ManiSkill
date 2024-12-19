@@ -1,0 +1,1 @@
+python ppo.py --env_id="final" --evaluate --checkpoint=runs/final__ppo__1__1734247581/ckpt_101.pt --num_eval_envs=1 --num-eval-steps=1000

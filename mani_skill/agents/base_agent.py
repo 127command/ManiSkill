@@ -169,7 +169,6 @@ class BaseAgent:
             urdf_config = sapien_utils.parse_urdf_config(self.urdf_config)
             sapien_utils.check_urdf_config(urdf_config)
             sapien_utils.apply_urdf_config(loader, urdf_config)
-
         if not os.path.exists(asset_path):
             print(f"Robot {self.uid} definition file not found at {asset_path}")
             if self.uid in assets.DATA_GROUPS or len(assets.DATA_GROUPS[self.uid]) > 0:

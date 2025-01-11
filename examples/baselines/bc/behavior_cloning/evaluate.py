@@ -3,7 +3,15 @@ from typing import Callable
 import numpy as np
 import torch
 
-def evaluate(n: int, sample_fn: Callable, eval_envs):
+def update_history_obs(obs, history_obs, history_window):
+    if len(history_obs) > 0:
+        history_obs = history_obs[1:]
+    history_obs.append(obs)
+    while len(history_obs) < history_window:
+        history_obs.append(obs)
+    return history_obs
+
+def evaluate(n: int, sample_fn: Callable, history_window: int, action_dim: int, eval_envs):
     """
     Evaluate the agent on the evaluation environments for at least n episodes.
 
@@ -20,9 +28,17 @@ def evaluate(n: int, sample_fn: Callable, eval_envs):
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
         eps_count = 0
+        history_obs = []
+        history_obs = update_history_obs(obs, history_obs, history_window)
+        if action_dim > 0:
+            action_history = np.zeros((obs.shape[0], action_dim))
         while eps_count < n:
-            action = sample_fn(obs)
+            if action_dim > 0:
+                action = sample_fn(np.concatenate([np.concatenate(history_obs, axis=-1), action_history], axis=-1))
+            else:
+                action = sample_fn(np.concatenate(history_obs, axis=-1))
             obs, _, _, truncated, info = eval_envs.step(action)
+            history_obs = update_history_obs(obs, history_obs, history_window)
             # note as there are no partial resets, truncated is True for all environments at the same time
             if truncated.any():
                 if isinstance(info["final_info"], dict):

@@ -781,6 +781,7 @@ class ManiSkillScene:
                 object.name not in self.state_dict_registry.actors
             ), f"Object {object.name} already in state dict registry"
             self.state_dict_registry.actors[object.name] = object
+            self.state_dict_registry.actors[object.name + "_0"] = object
         elif isinstance(object, Articulation):
             assert (
                 object.name not in self.state_dict_registry.articulations
@@ -839,6 +840,9 @@ class ManiSkillScene:
                 if len(actor_state.shape) == 1:
                     actor_state = actor_state[None, :]
                 # do not pass in env_idx to avoid redundant reset mask changes
+                # for key in self.state_dict_registry.actors.keys():
+                #     print(key)
+                # print(actor_id, actor_state)
                 self.state_dict_registry.actors[actor_id].set_state(actor_state, None)
         if "articulations" in state:
             for art_id, art_state in state["articulations"].items():

@@ -46,6 +46,9 @@ class Args:
     checkpoint: Optional[str] = None
     """path to a pretrained checkpoint file to start evaluation/training from"""
 
+    restart_logstd: bool = False
+    """if toggled, restart the logstd of the policy"""
+
     # Algorithm specific arguments
     env_id: str = "PickCube-v1"
     """the id of the environment"""
@@ -117,27 +120,28 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+import torch.optim.lr_scheduler as lr_scheduler
 
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(256, 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(256, 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 1)),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(256, 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(256, 256), std=np.sqrt(2)),
             nn.Tanh(),
-            layer_init(nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01*np.sqrt(2)),
+            layer_init(nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.ones(1, np.prod(envs.single_action_space.shape)) * -0.5)
 
@@ -188,11 +192,13 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    
+    default_device = "cuda:2"
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device(default_device if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="gpu")
+    env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend=default_device, render_backend=default_device)
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
@@ -243,7 +249,7 @@ if __name__ == "__main__":
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-
+    scheduler = lr_scheduler.CyclicLR(optimizer, base_lr=args.learning_rate, max_lr=args.learning_rate * 10, step_size_up=args.num_steps * 10, cycle_momentum=False)
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -269,6 +275,9 @@ if __name__ == "__main__":
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
+
+    if args.restart_logstd:
+        agent.actor_logstd.data = torch.ones(1, np.prod(envs.single_action_space.shape), device=device) * -0.1
 
     for iteration in range(1, args.num_iterations + 1):
         print(f"Epoch: {iteration}, global_step={global_step}")
@@ -301,9 +310,9 @@ if __name__ == "__main__":
             print(f"model saved to {model_path}")
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            # frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            # lrnow = frac * args.learning_rate
+            scheduler.step()
 
         rollout_time = time.time()
         for step in range(0, args.num_steps):

@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import tyro
 from mani_skill.utils import gym_utils
 from mani_skill.utils.io_utils import load_json
@@ -55,7 +56,7 @@ class Args:
     """the batch size of sample from the replay memory"""
 
     # Behavior cloning specific arguments
-    lr: float = 3e-4
+    lr: float = 1e-4
     """the learning rate for the actor"""
     normalize_states: bool = False
     """if toggled, states are normalized to mean 0 and standard deviation 1"""
@@ -146,6 +147,7 @@ class ManiSkillDataset(Dataset):
         self.env_id = self.env_info["env_id"]
         self.env_kwargs = self.env_info["env_kwargs"]
 
+        self.next_observations = []
         self.observations = []
         self.actions = []
         self.dones = []
@@ -162,22 +164,63 @@ class ManiSkillDataset(Dataset):
 
             # we use :-1 here to ignore the last observation as that
             # is the terminal observation which has no actions
-            self.observations.append(trajectory["obs"][:-1])
-            self.actions.append(trajectory["actions"])
-            self.dones.append(trajectory["success"].reshape(-1, 1))
+            obs = trajectory["obs"][:-1]
+            next_obs = trajectory["obs"][1:]
+            action = trajectory["actions"]
+            done = trajectory["success"].reshape(-1, 1)
+
+            history_action = np.concatenate([np.zeros_like(action[:1]), action[:-1].copy()], axis=0)
+            delta_action = action - history_action
+            obs = np.concatenate([obs, history_action], axis=-1)
+            action = np.concatenate([action, delta_action], axis=-1)
+
+            self.observations.append(obs)
+            self.next_observations.append(next_obs)
+            self.actions.append(action)
+            self.dones.append(done)
 
         self.observations = np.vstack(self.observations)
+        self.next_observations = np.vstack(self.next_observations)
         self.actions = np.vstack(self.actions)
         self.dones = np.vstack(self.dones)
         assert self.observations.shape[0] == self.actions.shape[0]
+        assert self.next_observations.shape[0] == self.actions.shape[0]
         assert self.dones.shape[0] == self.actions.shape[0]
+        # self.delta_observations = self.next_observations - self.observations
 
+        self.action_mean = None
+        self.action_std = None
+        self.obs_mean = None
+        self.obs_std = None
+        self.delta_obs_mean = None
+        self.delta_obs_std = None
+        self.normalized = normalize_states
         if normalize_states:
-            mean, std = self.get_state_stats()
-            self.observations = (self.observations - mean) / std
+            print("Normalizing actions")
+            self.action_mean, self.action_std = self.get_state_stats("action")
+            print("Stats shape", self.action_mean.shape, self.action_std.shape)
+            self.actions = (self.actions - self.action_mean) / self.action_std
+            self.obs_mean, self.obs_std = self.get_state_stats("obs")
+            # print("Normalizing delta obs")
+            # self.delta_obs_mean, self.delta_obs_std = self.get_state_stats("delta obs")
+            # print("Stats shape", self.delta_obs_mean.shape, self.delta_obs_std.shape)
+            # self.delta_observations = (self.delta_observations - self.delta_obs_mean) / self.delta_obs_std
 
-    def get_state_stats(self):
-        return np.mean(self.observations), np.std(self.observations)
+    def get_state_stats(self, state_name):
+        if not self.normalized:
+            return None, None
+        if state_name == "action":
+            if self.action_mean is not None and self.action_std is not None:
+                return self.action_mean, self.action_std
+            return np.mean(self.actions, axis=0), np.std(self.actions, axis=0)
+        if state_name == "obs":
+            if self.obs_mean is not None and self.obs_std is not None:
+                return self.obs_mean, self.obs_std
+            return np.mean(self.observations, axis=0), np.std(self.observations, axis=0)
+        if state_name == "delta obs":
+            if self.delta_obs_mean is not None and self.delta_obs_std is not None:
+                return self.delta_obs_mean, self.delta_obs_std
+            return np.mean(self.delta_observations, axis=0), np.std(self.delta_observations, axis=0) + 1e-8
 
     def __len__(self):
         return len(self.observations)
@@ -186,23 +229,47 @@ class ManiSkillDataset(Dataset):
         action = torch.from_numpy(self.actions[idx]).float().to(device=self.device)
         obs = torch.from_numpy(self.observations[idx]).float().to(device=self.device)
         done = torch.from_numpy(self.dones[idx]).to(device=self.device)
+        # delta_obs = torch.from_numpy(self.delta_observations[idx]).float().to(device=self.device)
         return obs, action, done
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, action_mean, action_std, obs_mean, obs_std):
         super(Actor, self).__init__()
 
+        self.action_mean = action_mean
+        self.action_std = action_std
+        self.obs_mean = obs_mean
+        self.obs_std = obs_std
+        assert action_mean.shape[0] == action_dim * 2
+        assert action_std.shape[0] == action_dim * 2
+        assert obs_mean.shape[0] == state_dim + action_dim
+        assert obs_std.shape[0] == state_dim + action_dim
+        self.state_dim = state_dim
+        self.action_dim = action_dim
         self.net = nn.Sequential(
             nn.Linear(state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
+            nn.Linear(256, action_dim * 2),
+        )
+
+        self.update_gate = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256),
+            nn.ReLU(),
             nn.Linear(256, action_dim),
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state)
+        assert state.shape[-1] == self.state_dim + self.action_dim
+        actions = self.net(state[..., :state_dim]) # [action, delta_action]
+        # sigma = torch.sigmoid(self.update_gate(state))
+        sigma = torch.clip(self.update_gate(state), min=-0.5, max=0.5) + 0.5
+        delta_action = (state[..., state_dim:] + (actions[..., action_dim:].clone().detach()*self.action_std[action_dim:]+self.action_mean[action_dim:]) - self.action_mean[:action_dim]) / self.action_std[:action_dim]
+        a_hat = sigma * actions[..., :action_dim].clone().detach() + (1-sigma) * delta_action
+
+        return a_hat, actions
 
 
 def save_ckpt(run_name, tag):
@@ -306,44 +373,78 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         ds, batch_sampler=itersampler, num_workers=args.num_dataload_workers
     )
+    state_dim = envs.single_observation_space.shape[0]
+    action_dim = envs.single_action_space.shape[0]
+    action_mean, action_std = None, None
+    obs_mean, obs_std = None, None
+    if args.normalize_states:
+        action_mean, action_std = ds.get_state_stats("action")
+        action_mean = torch.from_numpy(action_mean).to(device)
+        action_std = torch.from_numpy(action_std).to(device)
+        obs_mean, obs_std = ds.get_state_stats("obs")
+        obs_mean = torch.from_numpy(obs_mean).to(device)
+        obs_std = torch.from_numpy(obs_std).to(device)
     actor = Actor(
-        envs.single_observation_space.shape[0], envs.single_action_space.shape[0]
+        state_dim, action_dim, action_mean, action_std, obs_mean, obs_std
     )
     actor = actor.to(device=device)
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
+    # lr_scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_iters, eta_min=1e-7)
 
     best_eval_metrics = defaultdict(float)
 
+        # obs_mean, obs_std = ds.get_state_stats("obs")
+        # obs_mean = torch.from_numpy(obs_mean).to(device)
+        # obs_std = torch.from_numpy(obs_std).to(device)
+    losses = []
+    beta = 0.2
     for iteration, batch in tqdm(enumerate(dataloader)):
         log_dict = {}
-        obs, action, _ = batch
-        pred_action = actor(obs)
+        obs, total_action, _ = batch
+        action = total_action[..., 0:action_dim]
+        delta_action = total_action[..., action_dim:2*action_dim]
+        # obs[..., state_dim:] += torch.randn_like(obs[..., state_dim:]) * obs_std[state_dim:] * 0.1
+        a_hat, pred_actions = actor(obs)
 
         optimizer.zero_grad()
-        loss = F.mse_loss(pred_action, action)
+        a_hat_loss = F.mse_loss(a_hat, action)
+        action_loss = F.mse_loss(pred_actions[..., :action_dim], action)
+        delta_action_loss = F.mse_loss(pred_actions[..., action_dim:], delta_action)
+        # loss = a_hat_loss + (action_loss + delta_action_loss) * beta
+        loss = (a_hat_loss + action_loss + delta_action_loss) / 3.0
         loss.backward()
         optimizer.step()
+        # lr_scheduler.step()
+        losses.append(loss.item())
 
-        if iteration % args.log_freq == 0:
-            print(f"Iteration {iteration}, loss: {loss.item()}")
+        if (iteration + 1) % args.log_freq == 0:
+            print(f"Iteration {iteration}, loss: {np.mean(losses[-100:])}")
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
             )
             writer.add_scalar("losses/total_loss", loss.item(), iteration)
 
-        if iteration % args.eval_freq == 0:
+        if (iteration + 1) % args.eval_freq == 0 and iteration > 0:
             actor.eval()
+            # print(actor.beta)
 
-            def sample_fn(obs):
+            def sample_fn(obs, update=False):
                 if isinstance(obs, np.ndarray):
                     obs = torch.from_numpy(obs).float().to(device)
-                action = actor(obs)
+                # obs = (obs - obs_mean) / obs_std
+                a_hat, pred_actions = actor(obs)
+                if update:
+                    action = pred_actions[..., :action_dim]
+                else:
+                    action = a_hat[..., :action_dim]
+                if args.normalize_states:
+                    action = action * action_std[:action_dim] + action_mean[:action_dim]
                 if args.sim_backend == "cpu":
                     action = action.cpu().numpy()
                 return action
 
             with torch.no_grad():
-                eval_metrics = evaluate(args.num_eval_episodes, sample_fn, 1, 0, envs)
+                eval_metrics = evaluate(args.num_eval_episodes, sample_fn, envs, envs.single_action_space.shape[0], True, False, True)
             actor.train()
             print(f"Evaluated {len(eval_metrics['success_at_end'])} episodes")
             for k in eval_metrics.keys():
@@ -355,7 +456,7 @@ if __name__ == "__main__":
             for k in save_on_best_metrics:
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
-                    save_ckpt(run_name, f"best_eval_{k}")
+                    save_ckpt(run_name, f"best_eval_{k}_{eval_metrics[k]:.4f}_{str(iteration)}")
                     print(
                         f"New best {k}_rate: {eval_metrics[k]:.4f}. Saving checkpoint."
                     )

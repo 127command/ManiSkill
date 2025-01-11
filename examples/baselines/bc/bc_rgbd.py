@@ -174,6 +174,7 @@ class ManiSkillDataset(Dataset):
             eps = self.episodes[eps_id]
             trajectory = self.data[f"traj_{eps['episode_id']}"]
             trajectory = load_h5_data(trajectory)
+            
             agent = trajectory["obs"]["agent"]
             extra = trajectory["obs"]["extra"]
 
@@ -329,6 +330,7 @@ def save_ckpt(run_name, tag):
 
 
 if __name__ == "__main__":
+    # torch.cuda.set_device(2)
     args = tyro.cli(Args)
 
     if args.exp_name is None:
@@ -405,7 +407,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s"
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
-
     ds = ManiSkillDataset(
         args.demo_path,
         device=device,

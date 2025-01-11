@@ -2,7 +2,7 @@ import mani_skill.envs
 import gymnasium as gym
 from PIL import Image
 import numpy as np
-nu=1
+nu=19
 env = gym.make('final', render_mode="rgb_array", num_envs=nu, reconfiguration_freq=1)
 env.reset()
 for i in range(nu):

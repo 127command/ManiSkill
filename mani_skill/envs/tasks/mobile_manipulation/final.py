@@ -4,6 +4,7 @@ import numpy as np
 import sapien
 import sapien.physx as physx
 import torch
+import torch.nn.functional as F
 import trimesh
 
 from mani_skill import PACKAGE_ASSET_DIR
@@ -68,7 +69,7 @@ class FinalEnv(BaseEnv):
         PACKAGE_ASSET_DIR / "partnet_mobility/meta/info_bucket_train.json"
     )
 
-    min_open_frac = 0.75
+    min_open_frac = 0.8
 
     def __init__(
         self,
@@ -115,8 +116,8 @@ class FinalEnv(BaseEnv):
 
     @property
     def _default_human_render_camera_configs(self):
-        # pose = sapien_utils.look_at(eye=[-2.2, -1.3, 2], target=[-0, 0.5, 0])
-        pose = sapien_utils.look_at(eye=[0, 0, 2], target=[0, 0, 0])
+        pose = sapien_utils.look_at(eye=[-2.2, -1.3, 2.4], target=[-0, 0.5, 0])
+        # pose = sapien_utils.look_at(eye=[0, 0, 2], target=[0, 0, 0])
         return CameraConfig(
             "render_camera", pose=pose, width=512, height=512, fov=1, near=0.01, far=100
         )
@@ -207,6 +208,7 @@ class FinalEnv(BaseEnv):
         # we sample random cabinet model_ids with numpy as numpy is always deterministic based on seed, regardless of
         # GPU/CPU simulation backends. This is useful for replaying demonstrations.
         # model_ids = self._batched_episode_rng.choice(self.all_cabinet_model_ids)
+        self.once_stage1 = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         self.cube = actors.build_cube(
             self.scene,
@@ -216,9 +218,10 @@ class FinalEnv(BaseEnv):
             initial_pose=sapien.Pose(p=[-0.5, 0, 0.015]),
         )
 
-        self.goal_z=torch.tensor([0.015]*self.num_envs, device=self.device)
+        self.goal_z=torch.tensor([0.75]*self.num_envs, device=self.device)
 
         model_ids = self._batched_episode_rng.choice(self.all_cabinet_model_ids)
+        # model_ids = self.all_cabinet_model_ids
         link_ids = self._batched_episode_rng.randint(0, 2**31)
 
         self._cabinets = []
@@ -309,6 +312,15 @@ class FinalEnv(BaseEnv):
             self.cabinet_xyboxs.append(collision_mesh.bounding_box.bounds[:,:2])
         self.cabinet_xyboxs = common.to_tensor(self.cabinet_xyboxs, device=self.device)
 
+        self.bucket_xyboxs = []
+        for bucket in self._buckets:
+            collision_mesh = bucket.get_first_collision_mesh()
+            self.bucket_xyboxs.append(collision_mesh.bounding_box.bounds[:,:2])
+        self.bucket_xyboxs = common.to_tensor(self.bucket_xyboxs, device=self.device)
+
+        self.bucket_center_xy = torch.tensor([[0, -1.1]]*self.num_envs, device=self.device)
+        
+
         # get the qmin qmax values of the joint corresponding to the selected links
         target_qlimits = self.drawer_handle_link.joint.limits  # [b, 1, 2]
         qmin, qmax = target_qlimits[..., 0], target_qlimits[..., 1]
@@ -327,6 +339,7 @@ class FinalEnv(BaseEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
+            self.once_stage1[env_idx] = False
             b = len(env_idx)
             xy = torch.zeros((b, 3))
             xy[:, 2] = self.cabinet_zs[env_idx].clone()
@@ -403,6 +416,7 @@ class FinalEnv(BaseEnv):
             self.bucket_handle_link_goal.set_pose(
                 Pose.create_from_pq(p=self.handle_link_positions(self.bucket_handle_link, self.bucket_handle_link_pos, env_idx))
             )
+        print(self.bucket_center_xy[0])
 
     def _after_control_step(self):
         # after each control step, we update the goal position of the handle link
@@ -433,26 +447,26 @@ class FinalEnv(BaseEnv):
 
         cube_grasped = self.agent.is_grasping(self.cube)
 
-        cube_in_bucket = False
+        cube_height = self.cube.pose.p[:,2]
+
+        cube_in_bucket = (cube_height < 0.2) & (torch.linalg.norm(self.cube.pose.p[:,:2] - self.bucket_center_xy, axis=1) < 0.1)
 
         # bucket_grasped = True
 
         bucket_height = self.bucket.pose.p[:,2]
 
-        bucket_high_enough = bucket_height > 0.5
+        # bucket_high_enough = bucket_height > 0.5
 
-        cube_height = self.cube.pose.p[:,2]
-
-        cube_high_enough = cube_height > 0.7
+        cube_high_enough = cube_height > 0.65
 
         is_robot_static = self.agent.is_static(0.2)
 
         stage = torch.zeros(self.num_envs, device=self.device)
 
-        # if open_enough:
-        #     stage = 1
+        cur = open_enough & link_is_static & cube_grasped
+        self.once_stage1 = torch.where(cur, True, self.once_stage1)
 
-        stage = torch.where(open_enough, torch.tensor(1, device=self.device), stage)
+        stage = torch.where(self.once_stage1, torch.tensor(1, device=self.device), stage)
         
         # if cube_grasped:
         #     stage = 2
@@ -464,12 +478,14 @@ class FinalEnv(BaseEnv):
         # print(is_robot_static.shape)
 
         return {
-            "success": open_enough & link_is_static & is_robot_static & cube_grasped & cube_high_enough, # (torch.neg(cube_grasped)) & cube_in_bucket
+            "success": cube_in_bucket,
             "drawer_handle_link_pos": drawer_handle_link_pos,
             "open_enough": open_enough,
             "cube_high_enough": cube_high_enough,
             "is_robot_static": is_robot_static,
             "cube_grasped": cube_grasped,
+            "final_xy": self.bucket_center_xy,
+            "cube_in_bucket": cube_in_bucket,
             "stage": stage,
         }
 
@@ -478,23 +494,29 @@ class FinalEnv(BaseEnv):
             tcp_pose=self.agent.tcp.pose.raw_pose,
             cube_grasped=info["cube_grasped"],
             goal_high=self.goal_z,
+            stage=F.one_hot(info["stage"].long(), num_classes=2),
         )
 
-        if "state" in self.obs_mode:
-            obs.update(
-                tcp_to_drawer_handle_pos=info["drawer_handle_link_pos"] - self.agent.tcp.pose.p,
-                target_drawer_link_qpos=self.drawer_handle_link.joint.qpos,
-                target_drawer_handle_pos=info["drawer_handle_link_pos"],
-                obj_pose=self.cube.pose.raw_pose,
-                obj_high_diff=self.goal_z - self.cube.pose.p[:,2],
-            )
+        obs.update(
+            tcp_pos=self.agent.tcp.pose.p,
+            base_pos=self.agent.robot.pose.p,
+            obj_pos=self.cube.pose.p,
+            obj_high=self.cube.pose.p[:,2],
+            tcp_to_drawer_handle_pos=info["drawer_handle_link_pos"] - self.agent.tcp.pose.p,
+            target_drawer_link_qpos=self.drawer_handle_link.joint.qpos,
+            target_drawer_handle_pos=info["drawer_handle_link_pos"],
+            obj_pose=self.cube.pose.raw_pose,
+            obj_high_diff=self.goal_z - self.cube.pose.p[:,2],
+            final_diff=self.bucket_center_xy-self.cube.pose.p[:,:2],
+            final_goal=self.bucket_center_xy,
+        )
         return obs
     
     def stage0_reward(self, info: Dict):
         tcp_to_handle_dist = torch.linalg.norm(
             self.agent.tcp.pose.p - info["drawer_handle_link_pos"], axis=1
         )
-        reaching_reward = 1 - torch.tanh(5 * tcp_to_handle_dist)
+        reaching_reward = 1 - torch.tanh(2 * torch.sqrt(tcp_to_handle_dist))
         amount_to_open_left = torch.div(
             self.target_qpos - self.drawer_handle_link.joint.qpos, self.target_qpos
         )
@@ -505,34 +527,63 @@ class FinalEnv(BaseEnv):
         # print(open_reward.shape)
         open_reward[info["open_enough"]] = 3  # give max reward here
         reward = reaching_reward + open_reward
-        reward[info["success"]] = 5.0
-        return reward
-    
-    def stage1_reward(self, info: Dict):
+
         tcp_to_obj_dist = torch.linalg.norm(
             self.cube.pose.p - self.agent.tcp.pose.p, axis=1
         )
-        reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
-        reward = reaching_reward
+        reaching_reward = 1 - torch.tanh(2 * torch.sqrt(tcp_to_obj_dist))
+        reward += reaching_reward
 
         cube_grasped = info["cube_grasped"]
         reward += cube_grasped
 
-        obj_to_high_dist = torch.abs(self.cube.pose.p[:,2] - self.goal_z)
-        reach_reward = 1 - torch.tanh(5 * obj_to_high_dist)
-        reward += reach_reward * cube_grasped
+        return reward
+    
+    def stage1_reward(self, info: Dict):
+        cube_grasped = info["cube_grasped"]
+
+        robo_to_final_dist = torch.linalg.norm(
+            self.agent.robot.pose.p[:,:2] - self.bucket_center_xy, axis=1
+        )
+
+        reaching_reward = 1 - torch.tanh(2 * torch.sqrt(robo_to_final_dist))
+
+        reward = reaching_reward * cube_grasped
+
+        obj_to_final_dist = torch.linalg.norm(
+            self.cube.pose.p[:,:2] - self.bucket_center_xy, axis=1
+        )
+
+        reaching_reward = 1 - torch.tanh(2 * torch.sqrt(obj_to_final_dist))
+        reward += reaching_reward * cube_grasped
+
+        cube_not_grasped = ~info["cube_grasped"]
+        tcp_open_reward = torch.clip(self.agent.robot.get_qpos()[..., -2:], -0.3, 0.3).mean(dim=-1)
+        soft_reaching_reward = torch.exp(-3*obj_to_final_dist)
+        reward += cube_not_grasped*torch.clip(soft_reaching_reward*4-3, -1, 1) * 5
+        reward += tcp_open_reward*20*torch.clip(soft_reaching_reward*4-3, 0, 1) * 2
+
+        cube_low_high_reward = 1 - torch.tanh(2 * torch.sqrt(torch.abs(self.cube.pose.p[:,2])))
+        reward += cube_low_high_reward * torch.clip(soft_reaching_reward*4-3, -1, 1) * 2
+
+        cube_in_bucket = info["cube_in_bucket"]
+        reward += cube_in_bucket
 
         static_reward = 1 - torch.tanh(
             5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
         )
-        reward += static_reward * info["cube_high_enough"]
-        reward[info["success"]] = 5
+        reward += static_reward * cube_in_bucket
         return reward
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         reward = torch.zeros(self.num_envs, device=self.device)
-        reward = torch.where(info["stage"] == 0, self.stage0_reward(info), reward)
-        reward = torch.where(info["stage"] == 1, self.stage1_reward(info), reward)
+        reward = torch.where(info["stage"] == 0, self.stage0_reward(info)*0.3, reward)
+        if torch.isnan(reward).any():
+            print("!!!!!!!!!!!!")
+        reward = torch.where(info["stage"] == 1, self.stage1_reward(info)*0.4+3, reward)
+        if torch.isnan(reward).any():
+            print("############")
+        reward[info["success"]] = 10
         return reward
 
     def compute_normalized_dense_reward(

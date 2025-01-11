@@ -1,9 +1,4 @@
 {
-    "1000": {
-        "num_target_links": 2,
-        "partnet_mobility_id": 1000,
-        "scale": 0.6129399556808358
-    },
     "1004": {
         "num_target_links": 2,
         "partnet_mobility_id": 1004,
@@ -58,11 +53,6 @@
         "num_target_links": 1,
         "partnet_mobility_id": 1040,
         "scale": 0.45687656337449045
-    },
-    "1044": {
-        "num_target_links": 2,
-        "partnet_mobility_id": 1044,
-        "scale": 0.7593626494046017
     },
     "1045": {
         "num_target_links": 1,

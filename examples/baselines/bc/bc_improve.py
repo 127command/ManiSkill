@@ -56,7 +56,7 @@ class Args:
     """the batch size of sample from the replay memory"""
 
     # Behavior cloning specific arguments
-    lr: float = 1e-4
+    lr: float = 3e-4
     """the learning rate for the actor"""
     normalize_states: bool = False
     """if toggled, states are normalized to mean 0 and standard deviation 1"""
@@ -84,6 +84,8 @@ class Args:
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
+
+    chunk_size: int = 5
 
 
 # taken from here
@@ -134,6 +136,7 @@ class ManiSkillDataset(Dataset):
         device,
         load_count=-1,
         normalize_states=False,
+        chunk_size=0,
     ) -> None:
         self.dataset_file = dataset_file
         # for details on how the code below works, see the
@@ -153,6 +156,8 @@ class ManiSkillDataset(Dataset):
         self.dones = []
         self.total_frames = 0
         self.device = device
+        self.chunk_size = chunk_size
+        assert self.chunk_size > 0
         if load_count is None:
             load_count = len(self.episodes)
         print(f"Loading {load_count} episodes")
@@ -186,6 +191,7 @@ class ManiSkillDataset(Dataset):
         assert self.observations.shape[0] == self.actions.shape[0]
         assert self.next_observations.shape[0] == self.actions.shape[0]
         assert self.dones.shape[0] == self.actions.shape[0]
+        self.action_dim = self.actions.shape[-1] // 2
         # self.delta_observations = self.next_observations - self.observations
 
         self.action_mean = None
@@ -230,17 +236,25 @@ class ManiSkillDataset(Dataset):
         obs = torch.from_numpy(self.observations[idx]).float().to(device=self.device)
         done = torch.from_numpy(self.dones[idx]).to(device=self.device)
         # delta_obs = torch.from_numpy(self.delta_observations[idx]).float().to(device=self.device)
-        return obs, action, done
+        future_actions_list = []
+        index = idx
+        for i in range(self.chunk_size):
+            if index + 1 < self.actions.shape[0] and self.dones[index] < 1e-3:
+                index += 1
+            future_actions_list.append(torch.from_numpy(self.actions[index][..., self.action_dim:]))
+        future_actions = torch.concat(future_actions_list, dim=-1).to(device=self.device)
+        return obs, action, done, future_actions
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, action_mean, action_std, obs_mean, obs_std):
+    def __init__(self, state_dim: int, action_dim: int, action_mean, action_std, obs_mean, obs_std, chunk_size):
         super(Actor, self).__init__()
 
         self.action_mean = action_mean
         self.action_std = action_std
         self.obs_mean = obs_mean
         self.obs_std = obs_std
+        self.chunk_size = chunk_size
         assert action_mean.shape[0] == action_dim * 2
         assert action_std.shape[0] == action_dim * 2
         assert obs_mean.shape[0] == state_dim + action_dim
@@ -252,7 +266,7 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, action_dim * 2),
+            nn.Linear(256, action_dim * (2 + chunk_size)),
         )
 
         self.update_gate = nn.Sequential(
@@ -263,11 +277,13 @@ class Actor(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         assert state.shape[-1] == self.state_dim + self.action_dim
+        state_dim = self.state_dim
+        action_dim = self.action_dim
         actions = self.net(state[..., :state_dim]) # [action, delta_action]
         # sigma = torch.sigmoid(self.update_gate(state))
         sigma = torch.clip(self.update_gate(state), min=-0.5, max=0.5) + 0.5
-        delta_action = (state[..., state_dim:] + (actions[..., action_dim:].clone().detach()*self.action_std[action_dim:]+self.action_mean[action_dim:]) - self.action_mean[:action_dim]) / self.action_std[:action_dim]
-        a_hat = sigma * actions[..., :action_dim].clone().detach() + (1-sigma) * delta_action
+        delta_action = (state[..., state_dim:] + (actions[..., action_dim:action_dim*2].clone().detach()*self.action_std[action_dim:]+self.action_mean[action_dim:]) - self.action_mean[:action_dim]) / self.action_std[:action_dim]
+        a_hat = sigma * actions[..., 0:action_dim].clone().detach() + (1-sigma) * delta_action
 
         return a_hat, actions
 
@@ -363,6 +379,7 @@ if __name__ == "__main__":
         device=device,
         load_count=args.num_demos,
         normalize_states=args.normalize_states,
+        chunk_size=args.chunk_size,
     )
 
     obs, _ = envs.reset(seed=args.seed)
@@ -385,11 +402,11 @@ if __name__ == "__main__":
         obs_mean = torch.from_numpy(obs_mean).to(device)
         obs_std = torch.from_numpy(obs_std).to(device)
     actor = Actor(
-        state_dim, action_dim, action_mean, action_std, obs_mean, obs_std
+        state_dim, action_dim, action_mean, action_std, obs_mean, obs_std, args.chunk_size
     )
     actor = actor.to(device=device)
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
-    # lr_scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_iters, eta_min=1e-7)
+    lr_scheduler = lr_scheduler.MultiStepLR(optimizer, [int(args.total_iters * 0.7)], gamma=0.1, last_epoch=-1)
 
     best_eval_metrics = defaultdict(float)
 
@@ -400,21 +417,22 @@ if __name__ == "__main__":
     beta = 0.2
     for iteration, batch in tqdm(enumerate(dataloader)):
         log_dict = {}
-        obs, total_action, _ = batch
+        obs, total_action, _, future_actions = batch
         action = total_action[..., 0:action_dim]
         delta_action = total_action[..., action_dim:2*action_dim]
-        # obs[..., state_dim:] += torch.randn_like(obs[..., state_dim:]) * obs_std[state_dim:] * 0.1
+        obs += torch.randn_like(obs) * obs_std * 0.1
         a_hat, pred_actions = actor(obs)
 
         optimizer.zero_grad()
         a_hat_loss = F.mse_loss(a_hat, action)
-        action_loss = F.mse_loss(pred_actions[..., :action_dim], action)
-        delta_action_loss = F.mse_loss(pred_actions[..., action_dim:], delta_action)
+        action_loss = F.mse_loss(pred_actions[..., 0:action_dim], action)
+        delta_action_loss = F.mse_loss(pred_actions[..., action_dim:action_dim*2], delta_action)
+        future_action_loss = F.mse_loss(pred_actions[..., action_dim*2:], future_actions)
         # loss = a_hat_loss + (action_loss + delta_action_loss) * beta
-        loss = (a_hat_loss + action_loss + delta_action_loss) / 3.0
+        loss = (a_hat_loss + action_loss + delta_action_loss) / 3.0 + future_action_loss * 0.3
         loss.backward()
         optimizer.step()
-        # lr_scheduler.step()
+        lr_scheduler.step()
         losses.append(loss.item())
 
         if (iteration + 1) % args.log_freq == 0:

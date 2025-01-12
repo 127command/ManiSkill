@@ -449,7 +449,7 @@ class FinalEnv(BaseEnv):
 
         cube_height = self.cube.pose.p[:,2]
 
-        cube_in_bucket = (cube_height < 0.2) & (torch.linalg.norm(self.cube.pose.p[:,:2] - self.bucket_center_xy, axis=1) < 0.1)
+        cube_in_bucket = (cube_height < 0.3) & (torch.linalg.norm(self.cube.pose.p[:,:2] - self.bucket_center_xy, axis=1) < 0.1)
 
         # bucket_grasped = True
 

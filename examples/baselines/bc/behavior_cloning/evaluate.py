@@ -3,15 +3,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-def update_history_obs(obs, history_obs, history_window):
-    if len(history_obs) > 0:
-        history_obs = history_obs[1:]
-    history_obs.append(obs)
-    while len(history_obs) < history_window:
-        history_obs.append(obs)
-    return history_obs
-
-def evaluate(n: int, sample_fn: Callable, history_window: int, action_dim: int, eval_envs):
+def evaluate(n: int, sample_fn: Callable, eval_envs, action_dim, history_action=False, delta_action=False, update_action=False, gamma=0.8, delta_action_num=5):
     """
     Evaluate the agent on the evaluation environments for at least n episodes.
 
@@ -28,17 +20,27 @@ def evaluate(n: int, sample_fn: Callable, history_window: int, action_dim: int, 
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
         eps_count = 0
-        history_obs = []
-        history_obs = update_history_obs(obs, history_obs, history_window)
-        if action_dim > 0:
-            action_history = np.zeros((obs.shape[0], action_dim))
+        last_action = np.zeros((obs.shape[0], action_dim))
+        action_count = 0
         while eps_count < n:
-            if action_dim > 0:
-                action = sample_fn(np.concatenate([np.concatenate(history_obs, axis=-1), action_history], axis=-1))
+            if history_action:
+                input_state = np.concatenate([obs, last_action], axis=-1)
             else:
-                action = sample_fn(np.concatenate(history_obs, axis=-1))
+                input_state = obs
+
+            if update_action:
+                total_action = sample_fn(input_state, action_count == 0)
+            else:
+                total_action = sample_fn(input_state)
+
+            if delta_action and action_count != 0:
+                # gamma = (np.cos(np.pi * action_count / delta_action_num) + 1) * 0.5 * (max_gamma - min_gamma) + min_gamma
+                action = (total_action[:, action_dim:2*action_dim] + last_action) * gamma + total_action[:, :action_dim] *  (1-gamma)
+            else:
+                action = total_action[:, :action_dim]
+            action_count = (action_count + 1) % delta_action_num
+            last_action = action.copy()
             obs, _, _, truncated, info = eval_envs.step(action)
-            history_obs = update_history_obs(obs, history_obs, history_window)
             # note as there are no partial resets, truncated is True for all environments at the same time
             if truncated.any():
                 if isinstance(info["final_info"], dict):
